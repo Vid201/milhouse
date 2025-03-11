@@ -495,7 +495,6 @@ impl<T: Value + Send + Sync> Tree<T> {
     pub fn tree_hash(&self) -> Hash256 {
         match self {
             Self::Leaf(Leaf { hash, value }) => {
-                // FIXME(sproul): upgradeable RwLock?
                 let read_lock = hash.read();
                 let existing_hash = *read_lock;
                 drop(read_lock);
@@ -534,6 +533,100 @@ impl<T: Value + Send + Sync> Tree<T> {
                     tree_hash
                 }
             }
+        }
+    }
+
+    /// Prunes the tree by replacing unnecessary branches with their hashes.
+    /// The tree structure and depth remain the same, but branches that don't lead
+    /// to indices in the input are replaced with their hash values.
+    pub fn prune_keeping_structure(
+        &self,
+        indices: &std::collections::HashSet<usize>,
+        depth: usize,
+        prefix: usize,
+        default_value: T,
+        first_step: bool,
+    ) -> Result<Arc<Self>, Error> {
+        match self {
+            Self::Leaf(_) | Self::PackedLeaf(_) | Self::Zero(_) if depth == 0 => {
+                Ok(Arc::new(self.clone()))
+            }
+            Self::Node { left, right, hash } if depth > 0 => {
+                let new_depth = depth - 1;
+
+                let (new_left, new_right) = if first_step {
+                    let new_left = // Recursively prune left subtree
+                    left.prune_keeping_structure(
+                        indices,
+                        new_depth,
+                        0,
+                        default_value.clone(),
+                        false,
+                    )?;
+                    (new_left, right.clone())
+                } else {
+                    // Check if any indices are in the left or right subtrees
+                    let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
+
+                    let left_prefix = prefix;
+                    let right_prefix = prefix | (1 << (new_depth + packing_depth));
+                    let right_subtree_end = prefix + (1 << (depth + packing_depth));
+
+                    let mut has_left_updates = false;
+                    for key in left_prefix..right_prefix {
+                        if indices.contains(&key) {
+                            has_left_updates = true;
+                            break;
+                        }
+                    }
+                    let mut has_right_updates = false;
+                    for key in right_prefix..right_subtree_end {
+                        if indices.contains(&key) {
+                            has_right_updates = true;
+                            break;
+                        }
+                    }
+
+                    let new_left = if has_left_updates {
+                        // Recursively prune left subtree
+                        left.prune_keeping_structure(
+                            indices,
+                            new_depth,
+                            left_prefix,
+                            default_value.clone(),
+                            false,
+                        )?
+                    } else {
+                        // Replace left subtree with a leaf node
+                        Arc::new(Self::Leaf(Leaf::with_hash(
+                            default_value.clone(),
+                            left.tree_hash(),
+                        )))
+                    };
+
+                    let new_right = if has_right_updates {
+                        // Recursively prune right subtree
+                        right.prune_keeping_structure(
+                            indices,
+                            new_depth,
+                            right_prefix,
+                            default_value.clone(),
+                            false,
+                        )?
+                    } else {
+                        // Replace right subtree with a leaf node
+                        Arc::new(Self::Leaf(Leaf::with_hash(
+                            default_value.clone(),
+                            right.tree_hash(),
+                        )))
+                    };
+
+                    (new_left, new_right)
+                };
+
+                Ok(Self::node(new_left, new_right, *hash.read()))
+            }
+            _ => Ok(Arc::new(self.clone())),
         }
     }
 }

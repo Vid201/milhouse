@@ -353,6 +353,52 @@ impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
         }
         Ok(())
     }
+
+    /// Prunes the tree by replacing unnecessary branches with their hashes.
+    /// The tree structure and depth remain the same, but branches that don't lead
+    /// to indices in the input are replaced with their hash values.
+    ///
+    /// Note: The tree must be fully hashed before calling this function.
+    /// You should call `apply_updates()` and ensure the tree is hashed before pruning.
+    ///
+    /// # Arguments
+    /// * `indices` - Vector of indices to keep fully expanded in the tree
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Ok if pruning successful, Error if any index is invalid
+    pub fn prune(&mut self, indices: Vec<usize>, default_value: T) -> Result<(), Error> {
+        // Validate indices
+        if let Some(&max_index) = indices.iter().max() {
+            if max_index >= self.len() {
+                return Err(Error::OutOfBoundsUpdate {
+                    index: max_index,
+                    len: self.len(),
+                });
+            }
+        }
+
+        // Sort and deduplicate indices
+        let mut unique_indices: Vec<_> = indices.into_iter().collect();
+        unique_indices.sort_unstable();
+        unique_indices.dedup();
+
+        // Create a set of indices for faster lookup
+        let indices_set: std::collections::HashSet<_> = unique_indices.into_iter().collect();
+
+        // Prune the tree while maintaining structure
+        let pruned_tree = self.interface.backing.tree.prune_keeping_structure(
+            &indices_set,
+            self.interface.backing.depth,
+            0,
+            default_value,
+            true,
+        )?;
+
+        // Update the tree while keeping other properties the same
+        self.interface.backing.tree = pruned_tree;
+
+        Ok(())
+    }
 }
 
 impl<T: Value, N: Unsigned, U: UpdateMap<T>> Default for List<T, N, U> {
@@ -514,5 +560,95 @@ where
         } else {
             ssz::decode_list_of_variable_length_items(bytes, Some(max_len))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update_map::MaxMap;
+    use alloy_primitives::Uint;
+    use typenum::U8388608;
+    use vec_map::VecMap;
+
+    #[test]
+    fn test_prune() {
+        // Create a list with numbers 1 to 3213
+        let numbers: Vec<Uint<256, 4>> = (0..3213).map(|i| Uint::<256, 4>::from(i + 1)).collect();
+
+        // Create two identical lists - one to prune, one to keep full
+        let mut pruned_list: List<Uint<256, 4>, U8388608, MaxMap<VecMap<Uint<256, 4>>>> =
+            List::new(numbers.clone()).unwrap();
+        let mut full_list: List<Uint<256, 4>, U8388608, MaxMap<VecMap<Uint<256, 4>>>> =
+            List::new(numbers).unwrap();
+
+        // Ensure both trees are fully hashed before pruning
+        pruned_list.apply_updates().unwrap();
+        full_list.apply_updates().unwrap();
+
+        // Get initial hash
+        let initial_hash = pruned_list.tree_hash_root();
+        assert_eq!(
+            full_list.tree_hash_root(),
+            initial_hash,
+            "Initial hashes should match"
+        );
+
+        println!("Original tree structure:");
+        println!("tree hash root: {:?}", initial_hash);
+        println!("tree depth: {:?}", pruned_list.interface.backing.depth);
+        println!("{:#?}", pruned_list.interface.backing.tree);
+
+        // Keep only indices 123, 989, and 3065 in the pruned list
+        pruned_list
+            .prune(vec![123, 989, 3065], Uint::<256, 4>::from(0))
+            .unwrap();
+
+        println!("\nPruned tree structure (keeping indices 123, 989, 3065):");
+        println!("{:#?}", pruned_list.interface.backing.tree);
+
+        // Verify the tree structure is maintained
+        assert_eq!(pruned_list.len(), 3213, "Length should remain the same");
+        assert_eq!(
+            pruned_list.interface.backing.depth, full_list.interface.backing.depth,
+            "Depth should remain the same"
+        );
+
+        // Verify we can still access the kept indices
+        assert_eq!(pruned_list.get(123).unwrap(), &Uint::<256, 4>::from(124));
+        assert_eq!(pruned_list.get(989).unwrap(), &Uint::<256, 4>::from(990));
+        assert_eq!(pruned_list.get(3065).unwrap(), &Uint::<256, 4>::from(3066));
+
+        // Update value at index 989 in both lists
+        let new_value = Uint::<256, 4>::from(42);
+        pruned_list
+            .interface
+            .backing
+            .replace(989, new_value.clone())
+            .unwrap();
+        full_list.interface.backing.replace(989, new_value).unwrap();
+
+        // Apply updates to ensure hashes are recalculated
+        pruned_list.apply_updates().unwrap();
+        full_list.apply_updates().unwrap();
+
+        // Get new hashes
+        let pruned_hash = pruned_list.tree_hash_root();
+        let full_hash = full_list.tree_hash_root();
+
+        println!("\nAfter update at index 989:");
+        println!("Pruned tree hash: {:?}", pruned_hash);
+        println!("Full tree hash: {:?}", full_hash);
+
+        println!("Pruned tree len: {}", pruned_list.interface.backing.tree.compute_len());
+        println!("Full tree len: {}", full_list.interface.backing.tree.compute_len());
+
+        // Verify hashes match after update
+        assert_eq!(pruned_hash, full_hash, "Hashes should match after update");
+        assert_ne!(pruned_hash, initial_hash, "Hash should change after update");
+
+        // Verify the updated value is accessible in both lists
+        assert_eq!(pruned_list.get(989).unwrap(), &Uint::<256, 4>::from(42));
+        assert_eq!(full_list.get(989).unwrap(), &Uint::<256, 4>::from(42));
     }
 }
